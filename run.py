@@ -1,7 +1,6 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
-from config import TOKEN
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
