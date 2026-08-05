@@ -33,5 +33,6 @@ class Order(Base):
     is_paid = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+    admin_messages = Column(String, nullable=True)
 
     user = relationship("User")

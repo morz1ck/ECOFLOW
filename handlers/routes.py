@@ -1,5 +1,6 @@
+import json
 from aiogram import Router, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -14,7 +15,7 @@ from data_base.models import Order, User
 
 router = Router()
 
-ADMIN_ID = [1097519866]
+ADMIN_ID = [1097519866, 1473358975]
 
 
 def get_main_inline_keyboard():
@@ -62,6 +63,32 @@ def cancel_key():
         ]
     )
 
+
+def get_orders_menu_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚚 Активные заказы", callback_data="admin_orders:active")],
+            [InlineKeyboardButton(text="✅ Завершённые заказы", callback_data="admin_orders:done")],
+        ]
+    )
+
+
+def get_orders_list_keyboard(orders, category):
+    buttons = []
+    for o in orders:
+        label = f"№{o.id} — кв.{o.room_number}, {o.status}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"admin_order_detail:{o.id}:{category}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В начало списка", callback_data="admin_orders_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_order_detail_keyboard(category):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к списку", callback_data=f"admin_orders:{category}")],
+            [InlineKeyboardButton(text="🏠 В начало", callback_data="admin_orders_menu")],
+        ]
+    )
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -227,8 +254,17 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext):
     )
 
 
-    for id in ADMIN_ID:
-        await callback.bot.send_message(id, admin_text, reply_markup=get_confirm_order_keyboard(order_id))
+    admin_messages = {}
+    for admin_id in ADMIN_ID:
+        sent_message = await callback.bot.send_message(
+            admin_id, admin_text, reply_markup=get_confirm_order_keyboard(order_id)
+        )
+        admin_messages[str(admin_id)] = sent_message.message_id
+
+    with SessionLocal() as session:
+        order = session.query(Order).filter_by(id=order_id).first()
+        order.admin_messages = json.dumps(admin_messages)
+        session.commit()
 
     await callback.message.answer("Заказ отправлен курьеру, ожидайте подтверждения ⏳")
     await state.clear()
@@ -297,3 +333,97 @@ async def process_reject_order(callback: CallbackQuery):
     await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
     await callback.answer("Заказ отклонён")
 
+@router.message(Command("orders"))
+async def admin_orders_command(message: Message):
+    if message.from_user.id not in ADMIN_ID:
+        return
+    await message.answer("📋 Список заказов", reply_markup=get_orders_menu_keyboard())
+
+
+@router.callback_query(F.data == "admin_orders_menu")
+async def admin_orders_menu(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    await callback.message.edit_text("📋 Список заказов", reply_markup=get_orders_menu_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_orders:"))
+async def admin_orders_list(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    category = callback.data.split(":")[1]
+    statuses = ["new", "in_progress"] if category == "active" else ["done", "cancelled"]
+
+    with SessionLocal() as session:
+        orders = (
+            session.query(Order)
+            .filter(Order.status.in_(statuses))
+            .order_by(Order.created_at.desc())
+            .limit(20)
+            .all()
+        )
+
+        if not orders:
+            title = "🚚 Активные заказы" if category == "active" else "✅ Завершённые заказы"
+            await callback.message.edit_text(
+                f"{title}\n\nЗдесь пока пусто.",
+                reply_markup=get_orders_list_keyboard([], category),
+            )
+            await callback.answer()
+            return
+
+        title = "🚚 Активные заказы" if category == "active" else "✅ Завершённые заказы"
+        await callback.message.edit_text(title, reply_markup=get_orders_list_keyboard(orders, category))
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_order_detail:"))
+async def admin_order_detail(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    _, order_id_str, category = callback.data.split(":")
+    order_id = int(order_id_str)
+
+    with SessionLocal() as session:
+        order = session.query(Order).filter_by(id=order_id).first()
+        if order is None:
+            await callback.answer("Заказ не найден", show_alert=True)
+            return
+
+        client = session.query(User).filter_by(id=order.user_id).first()
+
+        order_type_text = "сейчас" if order.order_type == "order_now" else "на время"
+        status_text = {
+            "new": "🆕 Новый",
+            "in_progress": "🚚 В работе",
+            "done": "✅ Выполнен",
+            "cancelled": "❌ Отменён",
+        }.get(order.status, order.status)
+
+        text = (
+            f"📦 Заказ №{order.id}\n\n"
+            f"Статус: {status_text}\n"
+            f"Клиент: @{client.username or client.telegram_id}\n"
+            f"Тип: {order_type_text}\n"
+        )
+        if order.pickup_time:
+            text += f"Время: {order.pickup_time}\n"
+        text += (
+            f"Дом: №{order.house_number}, подъезд: {order.entrance}, "
+            f"этаж: {order.floor}, кв: {order.room_number}\n"
+            f"Куда положить: {order.door_or_concierge}\n"
+            f"Цена: {order.price}₽\n"
+            f"Создан: {order.created_at.strftime('%d.%m %H:%M')}\n"
+        )
+        if order.completed_at:
+            text += f"Завершён: {order.completed_at.strftime('%d.%m %H:%M')}\n"
+
+    await callback.message.edit_text(text, reply_markup=get_order_detail_keyboard(category))
+    await callback.answer()
