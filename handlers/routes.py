@@ -12,6 +12,7 @@ from forms.user import Form
 from data_base.db import SessionLocal
 from data_base.db import get_or_create_user
 from data_base.models import Order, User
+from datetime import datetime
 
 router = Router()
 
@@ -82,13 +83,41 @@ def get_orders_list_keyboard(orders, category):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_order_detail_keyboard(category):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад к списку", callback_data=f"admin_orders:{category}")],
-            [InlineKeyboardButton(text="🏠 В начало", callback_data="admin_orders_menu")],
+def get_order_detail_keyboard(category, order_id=None, status=None):
+    buttons = []
+
+    # Кнопка завершения показывается только у заказа, который уже принят в работу
+    if category == "active" and status == "in_progress":
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="✅ Завершить заказ",
+                    callback_data=f"complete_order:{order_id}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Назад к списку",
+                callback_data=f"admin_orders:{category}",
+            )
         ]
     )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🏠 В начало",
+                callback_data="admin_orders_menu",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -425,5 +454,80 @@ async def admin_order_detail(callback: CallbackQuery):
         if order.completed_at:
             text += f"Завершён: {order.completed_at.strftime('%d.%m %H:%M')}\n"
 
-    await callback.message.edit_text(text, reply_markup=get_order_detail_keyboard(category))
+    await callback.message.edit_text(
+    text,
+    reply_markup=get_order_detail_keyboard(
+        category=category,
+        order_id=order.id,
+        status=order.status,
+    ),
+)
     await callback.answer()
+
+@router.callback_query(F.data.startswith("complete_order:"))
+async def complete_order(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_ID:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    order_id = int(callback.data.split(":")[1])
+
+    with SessionLocal() as session:
+        order = session.query(Order).filter_by(id=order_id).first()
+
+        if order is None:
+            await callback.answer("Заказ не найден", show_alert=True)
+            return
+
+        if order.status != "in_progress":
+            await callback.answer("Этот заказ нельзя завершить", show_alert=True)
+            return
+
+        order.status = "done"
+        order.completed_at = datetime.utcnow()
+
+        session.commit()
+
+        client = (
+            session.query(User)
+            .filter_by(id=order.user_id)
+            .first()
+        )
+
+        client_telegram_id = client.telegram_id
+
+    await callback.bot.send_message(
+        client_telegram_id,
+        "✅ Ваш заказ выполнен. Спасибо, что пользуетесь ЭкоПотоком!",
+    )
+
+    # После завершения возвращаем администратора в список активных заказов
+    with SessionLocal() as session:
+        orders = (
+            session.query(Order)
+            .filter(
+                Order.status.in_(["new", "in_progress"])
+            )
+            .order_by(Order.created_at.desc())
+            .limit(20)
+            .all()
+        )
+
+    if orders:
+        await callback.message.edit_text(
+            "🚚 Активные заказы",
+            reply_markup=get_orders_list_keyboard(
+                orders,
+                "active",
+            ),
+        )
+    else:
+        await callback.message.edit_text(
+            "🚚 Активные заказы\n\nЗдесь пока пусто.",
+            reply_markup=get_orders_list_keyboard(
+                [],
+                "active",
+            ),
+        )
+
+    await callback.answer("Заказ завершён ✅")
